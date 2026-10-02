@@ -72,7 +72,9 @@ const canKO = sid => {
             <div v-if="m.note" class="note-line">📝 {{ m.note }}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">
               📍 {{ m.venue?.name }}
-              <span v-if="m.status==='scheduled'" style="margin-left:8px">🧑‍⚖️ {{ store.chiefOf(m.id)?.referee?.name || '主裁待安排' }}</span>
+              <span v-if="m.status==='scheduled'" style="margin-left:8px">
+                🧑‍⚖️ {{ store.crewOf(m.id).map(a => (a.role === 'chief' ? '主' : a.role === 'assistant' ? '助' : '台') + a.referee?.name).join(' · ') || '执法名单待安排' }}
+              </span>
               <span style="float:right" :class="m.status==='finished' ? 'tag g' : m.status==='void' ? 'tag r' : 'tag o'">{{ m.status==='finished' ? '已完赛' : m.status==='void' ? '已取消' : '待赛' }}</span>
             </div>
           </div>

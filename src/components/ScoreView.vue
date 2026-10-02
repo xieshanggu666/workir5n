@@ -84,8 +84,12 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
         </div>
         <div v-if="m.note" class="note-line">📝 {{ m.note }}</div>
         <div class="crew-line">
-          <span v-if="store.chiefOf(m.id)" class="tag b">🧑‍⚖️ 主裁：{{ store.chiefOf(m.id).referee?.name }}</span>
-          <span v-else-if="m.status==='scheduled'" class="tag o">🟠 尚未安排主裁</span>
+          <template v-if="store.crewOf(m.id).length">
+            <span v-for="a in store.crewOf(m.id)" :key="a.id" class="tag" :class="a.role === 'chief' ? 'b' : 'gray'">
+              {{ a.role === 'chief' ? '🧑‍⚖️ 主裁' : a.role === 'assistant' ? '🚩 助理' : '📋 记录台' }}：{{ a.referee?.name }}
+            </span>
+          </template>
+          <span v-if="m.status==='scheduled' && !store.chiefOf(m.id)" class="tag o">🟠 尚未安排主裁</span>
         </div>
         <div v-if="active?.id === m.id && needTB" class="tbrow">
           <span>⚔️ 常规时间平分 · 加时/点球决胜：</span>

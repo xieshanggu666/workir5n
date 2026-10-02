@@ -28,11 +28,9 @@ const maxPts = computed(() => Math.max(1, ...unitPoints.value.map(x => x.pts)))
 // —— 裁判排班联动报表 ——
 const refereeRows = computed(() => store.workload)
 const maxDone = computed(() => Math.max(1, ...refereeRows.value.map(r => (r.done || 0) + (r.upcoming || 0))))
-const coverage = computed(() => {
-  const pend = store.matches.filter(m => m.status === 'scheduled' && m.team_a && m.team_b && store.sports.find(s => s.id === m.sport_id)?.format !== 'track')
-  const covered = pend.filter(m => store.chiefOf(m.id))
-  return { total: pend.length, covered: covered.length, pct: pend.length ? Math.round(covered.length / pend.length * 100) : 100 }
-})
+// 整场覆盖率：按执法席位（主裁/助理/记录台）统计
+const coverage = computed(() => store.conflicts?.coverage || { slots_need: 0, slots_filled: 0, slots_pct: 100, roles: {} })
+const roleLabels = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
 const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
   .map(l => ({ ...l, name: { assign: '排班', force_assign: '强制排班', auto_assign: '自动排班', release: '解除', reassign: '临时调班', swap: '调班对调', match_change: '赛程变更', schedule_added: '赛程新增', schedule_rebuild: '赛程重排', match_finish: '完赛归档', void_release: '取消解除' }[l.action] || l.action })))
 </script>
@@ -76,7 +74,7 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
     <!-- 裁判执法工作量与排班覆盖 -->
     <div class="grid g2 mt">
       <div class="card">
-        <div class="caption">🧑‍⚖️ 裁判执法工作量 <span class="hint">已完赛 / 待赛（含历史场次）</span></div>
+        <div class="caption">🧑‍⚖️ 裁判执法工作量 <span class="hint">已完赛 / 待赛（主裁·助理·记录台）</span></div>
         <div class="pad" style="display:flex;flex-direction:column;gap:13px">
           <div v-for="r in refereeRows" :key="r.id">
             <div class="row spread" style="margin-bottom:6px">
@@ -86,17 +84,25 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
             <div class="hbar-duo">
               <i class="d" :style="{ width: ((r.done || 0) / maxDone) * 100 + '%' }"></i><i class="u" :style="{ width: ((r.upcoming || 0) / maxDone) * 100 + '%' }"></i>
             </div>
+            <div class="ph" style="font-size:11px;margin-top:3px">已执法 主{{ r.done_chief || 0 }}·助{{ r.done_assistant || 0 }}·台{{ r.done_recorder || 0 }}　待执法 主{{ r.upcoming_chief || 0 }}·助{{ r.upcoming_assistant || 0 }}·台{{ r.upcoming_recorder || 0 }}</div>
           </div>
         </div>
       </div>
       <div class="card">
-        <div class="caption">📡 排班覆盖率与最新变更</div>
+        <div class="caption">📡 整场排班覆盖率与最新变更</div>
         <div class="pad">
           <div class="row spread" style="margin-bottom:8px">
-            <span class="badge">待赛场次主裁覆盖率</span>
-            <b class="mono" style="font-size:16px;color:var(--accent)">{{ coverage.covered }}/{{ coverage.total }}（{{ coverage.pct }}%）</b>
+            <span class="badge">执法席位覆盖率（主裁/助理/记录台）</span>
+            <b class="mono" style="font-size:16px;color:var(--accent)">{{ coverage.slots_filled }}/{{ coverage.slots_need }}（{{ coverage.slots_pct }}%）</b>
           </div>
-          <div class="hbar"><i :style="{ width: coverage.pct + '%', background: coverage.pct === 100 ? 'var(--accent2)' : 'var(--accent)' }"></i></div>
+          <div class="hbar"><i :style="{ width: coverage.slots_pct + '%', background: coverage.slots_pct === 100 ? 'var(--accent2)' : 'var(--accent)' }"></i></div>
+          <div class="grid g3 mt16" style="gap:10px">
+            <div v-for="role in ['chief','assistant','recorder']" :key="role" class="role-mini">
+              <div class="row spread"><span class="ph" style="font-size:12px">{{ roleLabels[role] }}</span><b class="mono">{{ coverage.roles[role]?.filled || 0 }}/{{ coverage.roles[role]?.need || 0 }}</b></div>
+              <div class="hbar"><i :style="{ width: (coverage.roles[role]?.pct || 100) + '%', background: (coverage.roles[role]?.pct || 100) === 100 ? 'var(--accent2)' : 'var(--accent3)' }"></i></div>
+            </div>
+          </div>
+          <div v-if="store.conflicts?.crew_gaps?.length" class="tag o mt16">🟠 {{ store.conflicts.crew_gaps.length }} 场执法名单不齐</div>
           <div class="row spread mt16" style="margin-bottom:8px"><span class="badge">⛔ 未决冲突</span>
             <b :style="{ color: (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) ? '#e5484d' : 'var(--accent2)' }">
               {{ (store.conflicts?.referee_conflicts.length || 0) + (store.conflicts?.venue_conflicts.length || 0) }} 起
@@ -143,4 +149,7 @@ const recentLogs = computed(() => store.assignmentLogs.slice(0, 6)
 .hbar-duo i { display: block; height: 100%; border-radius: 20px; }
 .hbar-duo i.d { background: var(--accent2); }
 .hbar-duo i.u { background: var(--accent3); margin-left: 2px; }
+.role-mini { background: var(--bg2); border-radius: 10px; padding: 8px 10px; }
+.role-mini .hbar { height: 7px; border-radius: 20px; background: #e8edf3; overflow: hidden; margin-top: 5px; }
+.role-mini .hbar i { display: block; height: 100%; border-radius: 20px; }
 </style>
