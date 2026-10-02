@@ -8,6 +8,11 @@ const PORT = 4170
 /* ================= 裁判排班：常量与工具 ================= */
 const ROLE_NAME = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
 const ROLES = Object.keys(ROLE_NAME)
+// 整场执法组编制：每场球类场次 = 主裁 1 + 助理裁判 2 + 记录台 1
+const CREW_SPEC = { chief: 1, assistant: 2, recorder: 1 }
+// 执法角色 ↔ 裁判等级（智能排班优先等级契合，人手不足时允许跨等级兜底）
+const ROLE_LEVEL = { chief: '主裁', assistant: '助理裁判', recorder: '记录台' }
+const CREW_SLOT_TOTAL = ROLES.reduce((n, r) => n + CREW_SPEC[r], 0)
 
 function addLog(action, matchId, refereeId, detail, reason, operator) {
   run(`INSERT INTO assignment_logs (action,match_id,referee_id,detail,reason,operator)
@@ -40,19 +45,78 @@ function refSportOk(referee, sportId) {
   const sp = get('SELECT name, category FROM sports WHERE id=?', sportId)
   return referee.sport === sp?.name || referee.sport === sp?.category
 }
-// 为一场待赛挑选主裁：专长匹配优先 → 当前待赛负荷低优先 → 无时间冲突
-function pickChiefFor(m) {
-  if (!m.time_label) return null
-  const spoName = get('SELECT name FROM sports WHERE id=?', m.sport_id)?.name
-  const loadOf = rid => get(`SELECT COUNT(*) c FROM assignments a JOIN matches mm ON mm.id=a.match_id
-    WHERE a.referee_id=? AND a.status='assigned' AND mm.status='scheduled'`, rid)?.c ?? 0
-  const cands = all(`SELECT * FROM referees WHERE status IN ('就绪','在岗') ORDER BY id`)
-    .filter(r => refSportOk(r, m.sport_id))
-    .filter(r => refBusyMatches(r.id, m.time_label, m.id).length === 0)
-    .filter(r => !get(`SELECT id FROM assignments WHERE match_id=? AND referee_id=? AND status='assigned'`, m.id, r.id))
-    .map(r => ({ r, pri: r.sport === spoName ? 0 : 1, load: loadOf(r.id) }))
-    .sort((a, b) => a.pri - b.pri || a.load - b.load || a.r.id - b.r.id)
-  return cands[0]?.r || null
+function roleCountOfMatch(matchId, role) {
+  return get(`SELECT COUNT(*) c FROM assignments WHERE match_id=? AND role=? AND status='assigned'`, matchId, role)?.c ?? 0
+}
+// 该场缺失的执法岗位（role 可重复，如 assistant 缺 2 人则出现两次）
+function missingRolesOfMatch(matchId) {
+  const miss = []
+  ROLES.forEach(role => {
+    const n = roleCountOfMatch(matchId, role)
+    for (let i = n; i < CREW_SPEC[role]; i++) miss.push(role)
+  })
+  return miss
+}
+function isBallMatch(m) {
+  return !!m && m.status === 'scheduled' && m.team_a && m.team_b &&
+    get('SELECT format FROM sports WHERE id=?', m.sport_id)?.format !== 'track'
+}
+
+// —— 整场协同排班的内存上下文：统一跟踪专长契合、时段占用与待赛负荷 ——
+function buildSchedulingCtx(restrictMatchIds = null) {
+  const restrict = restrictMatchIds ? new Set(restrictMatchIds) : null
+  // 裁判 → 已占用的待赛时段（来自当前在派安排；restrict 内场次视为可被本轮填充）
+  const busyTimes = new Map()
+  // 裁判 → 当前待赛负荷（场次/岗位数）
+  const loads = new Map()
+  all(`SELECT a.referee_id rid, a.role, m.time_label tl, a.match_id mid
+       FROM assignments a JOIN matches m ON m.id=a.match_id
+       WHERE a.status='assigned' AND m.status='scheduled'`).forEach(r => {
+    if (restrict && restrict.has(r.mid)) return
+    if (r.tl) {
+      const set = busyTimes.get(r.rid) || new Set()
+      set.add(r.tl); busyTimes.set(r.rid, set)
+    }
+    loads.set(r.rid, (loads.get(r.rid) || 0) + 1)
+  })
+  const onMatch = new Map()
+  const ensureOn = mid => {
+    if (!onMatch.has(mid)) onMatch.set(mid, new Set(all(`SELECT referee_id FROM assignments WHERE match_id=? AND status='assigned'`, mid).map(x => x.referee_id)))
+    return onMatch.get(mid)
+  }
+  const spoName = new Map()
+  const isAvail = (r, m) => r.status === '就绪' || r.status === '在岗'
+  return {
+    busyTimes, loads, onMatch: ensureOn, isAvail,
+    // 为场次 m 的某个岗位挑选最合适裁判：等级契合优先 → 专长匹配优先 → 待赛负荷低 → 无时间冲突
+    pick(m, role) {
+      if (!spoName.has(m.sport_id)) spoName.set(m.sport_id, get('SELECT name FROM sports WHERE id=?', m.sport_id).name)
+      const wantLevel = ROLE_LEVEL[role]
+      const onSet = ensureOn(m.id)
+      const cands = all(`SELECT * FROM referees ORDER BY id`)
+        .filter(r => isAvail(r, m))
+        .filter(r => refSportOk(r, m.sport_id))
+        .filter(r => !onSet.has(r.id))
+        .filter(r => !(busyTimes.get(r.id)?.has(m.time_label)))
+        .map(r => ({
+          r,
+          lvl: r.level === wantLevel ? 0 : 1,
+          pri: r.sport === spoName.get(m.sport_id) ? 0 : 1,
+          load: loads.get(r.id) || 0
+        }))
+        .sort((a, b) => a.lvl - b.lvl || a.pri - b.pri || a.load - b.load || a.r.id - b.r.id)
+      return cands[0]?.r || null
+    },
+    // 落实一次岗位分配，同步更新上下文（事务外调用，调用方负责写库）
+    commit(matchId, refereeId, timeLabel) {
+      if (timeLabel) {
+        const set = busyTimes.get(refereeId) || new Set()
+        set.add(timeLabel); busyTimes.set(refereeId, set)
+      }
+      loads.set(refereeId, (loads.get(refereeId) || 0) + 1)
+      ensureOn(matchId).add(refereeId)
+    }
+  }
 }
 
 /* ================= 排班 / 调班 / 解除 ================= */
@@ -131,21 +195,22 @@ function reassignAssignment(assignmentId, { target_id, new_referee_id, reason, o
       const err = new Error(`专长不符：${refB0.name} 的专长为「${refB0.sport}」，不能调至 ${get('SELECT name FROM sports WHERE id=?', m.sport_id).name} 场次`)
       err.code = 'SKILL_MISMATCH'; throw err
     }
-    // 调班后冲突预检
-    const busyA = refBusyMatches(a.referee_id, mb.time_label, m.id)
+    // 调班后冲突预检：refA 将去 mb（排除其原场次 m），refB 将去 m（排除其原场次 mb）
+    const busyA = refBusyMatches(a.referee_id, mb.time_label, mb.id)
     if (busyA.length) {
       const err = new Error(`调班冲突：对调后该裁判在 ${mb.time_label} 仍有其它执法`)
       err.code = 'CONFLICT'
       err.conflicts = { referee: busyA.map(x => ({ match_id: x.id, title: matchTitle(x) })) }
       throw err
     }
-    const busyB = refBusyMatches(b.referee_id, m.time_label, mb.id)
+    const busyB = refBusyMatches(b.referee_id, m.time_label, m.id)
     if (busyB.length) {
       const err = new Error(`调班冲突：对调后该裁判在 ${m.time_label} 仍有其它执法`)
       err.code = 'CONFLICT'
       err.conflicts = { referee: busyB.map(x => ({ match_id: x.id, title: matchTitle(x) })) }
       throw err
     }
+    // 对调：refA 转到 mb、refB 转到 m；岗位角色随安排走（只换人不换岗）
     const r1 = run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, mb.id, a.referee_id, a.role)
     const r2 = run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, m.id, b.referee_id, b.role)
     run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id IN (?,?)`, a.id, b.id)
@@ -182,21 +247,47 @@ function reassignAssignment(assignmentId, { target_id, new_referee_id, reason, o
   return { ok: true, swapped: false, new_a: Number(r.lastInsertRowid) }
 }
 
-// 智能排班：为尚无主裁的待赛场次，按"专长匹配 → 无时间冲突"自动安排主裁
-function autoAssign(operator = '组委会') {
-  const need = all(`SELECT m.* FROM matches m WHERE m.status='scheduled'
-                    AND m.team_a IS NOT NULL AND m.team_b IS NOT NULL
-                    AND NOT EXISTS (SELECT 1 FROM assignments a WHERE a.match_id=m.id AND a.role='chief' AND a.status='assigned')`)
+// 整场协同智能排班核心：为给定场次按编制补齐 主裁/助理裁判×2/记录台。
+// 统一处理等级契合、专长匹配、时段冲突与待赛负荷；restrictIds 内场次视为本轮可占用。
+function autoCrewCore(matchIds, { operator = '组委会', reason = '智能排班', logPhrase = '自动排班' } = {}) {
   const assigned = [], skipped = []
-  for (const m of need) {
+  const ids = matchIds || []
+  const ctx = buildSchedulingCtx(ids.length ? ids : null)
+  const matches = ids.map(id => get('SELECT * FROM matches WHERE id=?', id)).filter(Boolean)
+  // 按开赛时间、场次序逐场填充，让负荷在全天范围内均衡
+  matches.sort((a, b) => (a.time_label || '').localeCompare(b.time_label || '') || (a.order_no || 0) - (b.order_no || 0) || a.id - b.id)
+  for (const m of matches) {
+    if (!isBallMatch(m)) continue
     if (!m.time_label) { skipped.push({ match_id: m.id, title: matchTitle(m), reason: '未排定开赛时间' }); continue }
-    const pick = pickChiefFor(m)
-    if (!pick) { skipped.push({ match_id: m.id, title: matchTitle(m), reason: '该时段无可用（专长匹配且无冲突）裁判' }); continue }
-    run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?, 'chief','assigned')`, m.id, pick.id)
-    addLog('auto_assign', m.id, pick.id, `${matchTitle(m)} → ${pick.name} 自动排班为主裁`, '智能排班', operator)
-    assigned.push({ match_id: m.id, title: matchTitle(m), referee: pick.name })
+    const needRoles = missingRolesOfMatch(m.id)
+    if (!needRoles.length) continue
+    const got = []
+    for (const role of needRoles) {
+      const pick = ctx.pick(m, role)
+      if (!pick) continue
+      run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, m.id, pick.id, role)
+      ctx.commit(m.id, pick.id, m.time_label)
+      addLog('auto_assign', m.id, pick.id, `${matchTitle(m)} → ${pick.name} ${logPhrase}为${ROLE_NAME[role]}`, reason, operator)
+      got.push({ role, referee: pick.name })
+    }
+    if (got.length) assigned.push({ match_id: m.id, title: matchTitle(m), slots: got })
+    const still = missingRolesOfMatch(m.id)
+    if (still.length) {
+      skipped.push({
+        match_id: m.id, title: matchTitle(m),
+        reason: `该时段无足够可用（等级/专长匹配且无冲突）裁判，缺：${[...new Set(still.map(r => ROLE_NAME[r]))].join('、')}`
+      })
+    }
   }
   return { assigned, skipped }
+}
+
+// 智能排班：为所有执法组未满编的待赛场次补齐整场裁判
+function autoAssign(operator = '组委会') {
+  const need = all(`SELECT m.* FROM matches m JOIN sports s ON s.id=m.sport_id
+                    WHERE m.status='scheduled' AND s.format<>'track'
+                      AND m.team_a IS NOT NULL AND m.team_b IS NOT NULL`).map(m => m.id)
+  return autoCrewCore(need, { operator, reason: '智能排班', logPhrase: '自动排班' })
 }
 
 // 赛程变更：调整场次时间/场地，联动校验该场全部执法安排与场地占用
@@ -264,11 +355,15 @@ function seed() {
   const venues = ['中心篮球馆', '五人足球场', '羽毛球馆', '田径场', '备用2号场']
   venues.forEach(v => run('INSERT INTO venues (name,type) VALUES (?,?)', v, 'arena'))
 
-  // 裁判（专长 / 等级）
+  // 裁判（专长 / 等级）；按整场执法组（主裁1·助理2·记录台1）扩充名册
   const refRows = [
     ['王裁判', '篮球', '主裁'], ['李裁判', '篮球', '助理裁判'],
+    ['周裁判', '篮球', '助理裁判'], ['吴裁判', '篮球', '记录台'],
     ['张裁判', '五人制足球', '主裁'], ['赵裁判', '五人制足球', '助理裁判'],
-    ['陈裁判', '羽毛球', '主裁'], ['孙裁判', null, '主裁']   // 综合执法
+    ['钱裁判', '五人制足球', '助理裁判'], ['冯裁判', '五人制足球', '记录台'],
+    ['陈裁判', '羽毛球', '主裁'], ['褚裁判', '羽毛球', '助理裁判'],
+    ['卫裁判', '羽毛球', '助理裁判'], ['蒋裁判', '羽毛球', '记录台'],
+    ['沈裁判', null, '记录台'], ['孙裁判', null, '主裁']   // 综合执法
   ]
   const refId = {}
   refRows.forEach(([n, sp, lv]) => { const r = run('INSERT INTO referees (name,sport,level,status) VALUES (?,?,?,?)', n, sp, lv, '就绪'); refId[n] = Number(r.lastInsertRowid) })
@@ -342,12 +437,27 @@ function seed() {
   const marks = [10.62, 10.88, 11.05, 11.21, 11.35, 11.42, 11.58, 11.79]
   all('SELECT id,name FROM athletes').forEach((ath, i) => run('INSERT INTO entries (sport_id,athlete_id,mark,rank,unit_id) VALUES (?,?,?,?,?)', sp100, ath.id, marks[i], i + 1, get('SELECT unit_id FROM athletes WHERE id=?', ath.id).unit_id))
 
-  // —— 历史执法安排（已完赛场次：静默回填，作为工作量统计口径）——
+  // —— 历史执法安排（已完赛场次：静默回填整场执法组，作为工作量统计口径）——
   const seedHist = (mid, rid, role = 'chief') => run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,?,'assigned')`, mid, rid, role)
-  const footDone = all(`SELECT id FROM matches WHERE sport_id=? AND status='finished' ORDER BY id`, spFoot).map(x => x.id)
-  all(`SELECT id FROM matches WHERE sport_id=? AND status='finished' ORDER BY id`, spBasket).forEach((x, i) => seedHist(x.id, refId['王裁判'])); seedHist(get(`SELECT id FROM matches WHERE sport_id=? AND status='finished' ORDER BY id LIMIT 1`, spBasket).id, refId['李裁判'], 'recorder')
-  footDone.forEach(x => seedHist(x, refId['张裁判']))
-  badIds.forEach(x => seedHist(x, refId['陈裁判']))
+  // 为已完赛场次轮转回填整场执法组（主裁1·助理2·记录台1）
+  const seedCrew = (ids, names, gap) => {
+    const pool = names.map(n => refId[n])
+    ids.forEach((mid, mi) => {
+      const p = mi * gap
+      seedHist(mid, pool[p % pool.length], 'chief')
+      seedHist(mid, pool[(p + 1) % pool.length], 'assistant')
+      seedHist(mid, pool[(p + 2) % pool.length], 'assistant')
+      seedHist(mid, pool[(p + 3) % pool.length], 'recorder')
+    })
+  }
+  // 篮球 6 场（各场时段互不重叠，步长 1 轮转）
+  seedCrew(all(`SELECT id FROM matches WHERE sport_id=? AND status='finished' ORDER BY id`, spBasket).map(x => x.id),
+    ['王裁判', '李裁判', '周裁判', '吴裁判', '孙裁判'], 1)
+  // 足球 4 场（步长 2 轮转，让同一名裁判错开出现在不同时段）
+  seedCrew(all(`SELECT id FROM matches WHERE sport_id=? AND status='finished' ORDER BY id`, spFoot).map(x => x.id),
+    ['张裁判', '赵裁判', '钱裁判', '冯裁判', '孙裁判'], 2)
+  // 羽毛球 2 场半决赛（09:30 / 10:00 不同时段）
+  seedCrew(badIds, ['陈裁判', '褚裁判', '卫裁判', '蒋裁判', '孙裁判'], 2)
 
   // —— 为已有队伍/运动员补建「已通过」报名记录（完整审计轨迹）——
   all('SELECT id, name, unit_id, sport_id FROM teams').forEach(t => {
@@ -378,23 +488,22 @@ function seed() {
   addPendingTeam('飞鹰二队', '飞鹰学院', spFoot)
   addPendingAthlete('许诺', '星河学院', sp100)
 
-  // —— 淘汰赛按真实赛果动态生成（与赛程编排页同一入口）——
+  // —— 淘汰赛按真实赛果动态生成（与赛程编排页同一入口；生成即触发整场协同排班）——
   generateKO(spBad)
-  // 决赛已自动排班；季军战留空，展示"待安排"覆盖率
-  const finalM = get(`SELECT * FROM matches WHERE sport_id=? AND stage='决赛'`, spBad)
-  if (finalM && !get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, finalM.id)) {
-    assignReferee(finalM.id, refId['陈裁判'], 'chief', '组委会', '淘汰赛编排后联动排班')
-  }
+  // 决赛保留满编执法组；季军战解除部分岗位，展示"执法组未满编"覆盖率预警
   const thirdM = get(`SELECT * FROM matches WHERE sport_id=? AND stage='季军'`, spBad)
   if (thirdM) {
-    const thirdChief = get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, thirdM.id)
-    if (thirdChief) releaseAssignment(thirdChief.id, '组委会', '季军战裁判长待定，暂时留空待排班')
+    all(`SELECT * FROM assignments WHERE match_id=? AND status='assigned' AND role<>'chief'`, thirdM.id).forEach(a =>
+      run(`UPDATE assignments SET status='released', released_at=datetime('now','localtime') WHERE id=?`, a.id))
+    addLog('release', thirdM.id, null, `${matchTitle(thirdM)}：助理裁判/记录台待裁判长终定，暂时留空待排班`, '季军战执法组待定', '组委会')
   }
 
-  // —— 待赛小组末轮排班 + 一次临时调班演示（完整留痕）——
+  // —— 待赛小组末轮：A 组初排部分岗位（演示"未满编"），B 组初排主裁后与 A 组对调（完整留痕）——
   const mA3 = get(`SELECT id FROM matches WHERE sport_id=? AND group_name='A组' AND status='scheduled'`, spFoot).id
   const mB3 = get(`SELECT id FROM matches WHERE sport_id=? AND group_name='B组' AND status='scheduled'`, spFoot).id
   const aAss = assignReferee(mA3, refId['赵裁判'], 'chief', '组委会', '末轮初排')
+  assignReferee(mA3, refId['钱裁判'], 'assistant', '组委会', '末轮初排')
+  assignReferee(mA3, refId['冯裁判'], 'recorder', '组委会', '末轮初排')
   assignReferee(mB3, refId['张裁判'], 'chief', '组委会', '末轮初排')
   reassignAssignment(aAss.id, { target_id: get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, mB3).id, reason: '赵裁判临时请假，末轮主裁对调', operator: '裁判长' })
 
@@ -487,25 +596,9 @@ function finishMatch(id, sa, sb, tbA = null, tbB = null) {
   lockAssignmentsOnFinish({ ...m, status: 'finished' }, '系统')
 }
 
-// 新增场次后：尝试自动安排主裁（失败不阻断编排，供排班页处理）
-function autoChiefForNewMatches(matchIds, operator = '系统') {
-  const assigned = [], skipped = []
-  matchIds.forEach(id => {
-    const m = get('SELECT * FROM matches WHERE id=?', id)
-    if (!m) return
-    if (!m.time_label) { skipped.push({ match_id: m.id, title: matchTitle(m), reason: '未排定开赛时间' }); return }
-    const has = get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, id)
-    if (has) return
-    const pick = pickChiefFor(m)
-    if (!pick) {
-      skipped.push({ match_id: m.id, title: matchTitle(m), reason: '该时段无可用（专长匹配且无冲突）裁判' })
-      return
-    }
-    run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,'chief','assigned')`, id, pick.id)
-    addLog('auto_assign', id, pick.id, `${matchTitle(m)} → ${pick.name} 随赛程生成自动排班为主裁`, '赛程新增联动', operator)
-    assigned.push({ match_id: m.id, title: matchTitle(m), referee: pick.name })
-  })
-  return { assigned, skipped }
+// 新增场次后：尝试自动补齐整场执法组（失败不阻断编排，供排班页处理）
+function autoCrewForNewMatches(matchIds, operator = '系统') {
+  return autoCrewCore(matchIds, { operator, reason: '赛程新增联动', logPhrase: '随赛程生成自动排班为' })
 }
 
 // 循环赛重排的场次初始化：保留仍存在对阵的时间/场地，新对阵补齐不撞场的默认时段
@@ -554,7 +647,7 @@ function generateKO(sportId) {
       const ids = [Number(r1.lastInsertRowid), Number(r2.lastInsertRowid)]
       ids.forEach(id => addLog('schedule_added', id, null, `${matchTitle(get('SELECT * FROM matches WHERE id=?', id))} 由淘汰赛编排生成`, null, '系统'))
       // 赛程变更同步更新执法安排：新场次自动排班（无可用裁判时留待排班页处理）
-      autoChiefForNewMatches(ids, '系统')
+      autoCrewForNewMatches(ids, '系统')
       return '已生成羽毛球 决赛 与 季军战'
     }
     return null
@@ -581,7 +674,7 @@ function generateKO(sportId) {
       const r2 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '半决赛', B[0], A[1], vid('五人足球场'), 100, '14:30', 'scheduled')
       const ids = [Number(r1.lastInsertRowid), Number(r2.lastInsertRowid)]
       ids.forEach(id => addLog('schedule_added', id, null, `${matchTitle(get('SELECT * FROM matches WHERE id=?', id))} 由小组出线排名生成`, null, '系统'))
-      autoChiefForNewMatches(ids, '系统')
+      autoCrewForNewMatches(ids, '系统')
       return '已按小组排名生成足球半决赛'
     }
     return null
@@ -596,7 +689,7 @@ function generateKO(sportId) {
     const r2 = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', sportId, '季军', l1, l2, vid('备用2号场'), 102, '15:30', 'scheduled')
     const ids = [Number(r1.lastInsertRowid), Number(r2.lastInsertRowid)]
     ids.forEach(id => addLog('schedule_added', id, null, `${matchTitle(get('SELECT * FROM matches WHERE id=?', id))} 由半决赛赛果生成`, null, '系统'))
-    autoChiefForNewMatches(ids, '系统')
+    autoCrewForNewMatches(ids, '系统')
     return '已生成决赛 与 季军战'
   }
   return null
@@ -661,10 +754,11 @@ function approveRegistration(regId, reviewer) {
           reg.sport_id, '循环', a, b, venueId, ono, timeLabel, 'scheduled')
         newIds.push(Number(r.lastInsertRowid))
       })
-      const chiefResult = autoChiefForNewMatches(newIds, reviewer || '系统')
-      const skipText = chiefResult.skipped.length ? `；${chiefResult.skipped.length} 场待排班` : ''
+      const chiefResult = autoCrewForNewMatches(newIds, reviewer || '系统')
+      const filledSlots = chiefResult.assigned.reduce((n, x) => n + (x.slots?.length || 0), 0)
+      const skipText = chiefResult.skipped.length ? `；${chiefResult.skipped.length} 场执法组未满编` : ''
       addLog('schedule_rebuild', null, null,
-        `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场；时间、场地已初始化，自动安排主裁 ${chiefResult.assigned.length} 场${skipText}`,
+        `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场；时间、场地已初始化，整场协同排班补齐 ${filledSlots} 个执法岗位、覆盖 ${chiefResult.assigned.length} 场${skipText}`,
         null, reviewer || '系统')
     }
   } else {
@@ -817,10 +911,23 @@ app.get('/api/assignment-logs', (req, res) => {
     ORDER BY l.id DESC LIMIT ?`, limit)
   res.json(rows)
 })
-// 冲突与排班覆盖总览：待安排 / 裁判撞档 / 场地撞场 / 专长不符
+// 冲突与排班覆盖总览：整场执法组缺岗 / 裁判撞档 / 场地撞场 / 专长不符
 app.get('/api/conflicts', (_, res) => {
-  const scheduled = all(`SELECT * FROM matches WHERE status='scheduled' AND team_a IS NOT NULL AND team_b IS NOT NULL`)
-  const unassigned = scheduled.filter(m => !get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, m.id))
+  const scheduled = all(`SELECT m.* FROM matches m JOIN sports s ON s.id=m.sport_id
+                         WHERE m.status='scheduled' AND m.team_a IS NOT NULL AND m.team_b IS NOT NULL AND s.format<>'track'`)
+  // 缺岗：按编制（主裁1/助理2/记录台1）任一座位未补齐
+  const incomplete = []
+  const unassigned = []
+  scheduled.forEach(m => {
+    const miss = missingRolesOfMatch(m.id)
+    if (miss.length) {
+      const byRole = {}
+      miss.forEach(r => { byRole[r] = (byRole[r] || 0) + 1 })
+      const item = { match_id: m.id, title: matchTitle(m), missing_roles: byRole, missing: miss.length, filled: CREW_SLOT_TOTAL - miss.length, total_slots: CREW_SLOT_TOTAL }
+      incomplete.push(item)
+      if (!roleCountOfMatch(m.id, 'chief')) unassigned.push({ match_id: m.id, title: matchTitle(m) })
+    }
+  })
   const refereeConflicts = []
   all(`SELECT a.* FROM assignments a WHERE a.status='assigned'`).forEach(a => {
     const m = get(`SELECT * FROM matches WHERE id=?`, a.match_id)
@@ -852,20 +959,37 @@ app.get('/api/conflicts', (_, res) => {
     const m = get(`SELECT * FROM matches WHERE id=?`, a.match_id)
     if (!m || m.status !== 'scheduled') return
     const r = get('SELECT * FROM referees WHERE id=?', a.referee_id)
-    if (!refSportOk(r, m.sport_id)) skillMismatch.push({ assignment_id: a.id, referee: r.name, referee_sport: r.sport, match_id: m.id, title: matchTitle(m) })
+    if (!refSportOk(r, m.sport_id)) skillMismatch.push({ assignment_id: a.id, referee: r.name, referee_sport: r.sport, role: a.role, match_id: m.id, title: matchTitle(m) })
   })
+  const slotTotal = scheduled.length * CREW_SLOT_TOTAL
+  const slotFilled = slotTotal - incomplete.reduce((n, x) => n + x.missing, 0)
   res.json({
-    unassigned: unassigned.map(m => ({ match_id: m.id, title: matchTitle(m) })),
+    unassigned,                      // 未派主裁的场次（兼容旧口径）
+    incomplete_matches: incomplete,  // 整场执法组未满编场次（含缺岗明细）
+    coverage: {
+      matches: scheduled.length,
+      crew_ready: scheduled.length - incomplete.length,
+      slots_total: slotTotal,
+      slots_filled: slotFilled,
+      pct: slotTotal ? Math.round(slotFilled / slotTotal * 100) : 100
+    },
+    crew_spec: CREW_SPEC,
     referee_conflicts: refereeConflicts,
     venue_conflicts: venueConflicts,
     skill_mismatch: skillMismatch
   })
 })
-// 裁判执法工作量（含历史完赛场次）
+// 裁判执法工作量（含历史完赛场次），按主裁/助理/记录台拆分岗位数
 app.get('/api/referee-workload', (_, res) => {
   res.json(all(`SELECT r.id, r.name, r.sport, r.level, r.status,
       SUM(CASE WHEN m.status='finished' THEN 1 ELSE 0 END) done,
-      SUM(CASE WHEN m.status='scheduled' THEN 1 ELSE 0 END) upcoming
+      SUM(CASE WHEN m.status='scheduled' THEN 1 ELSE 0 END) upcoming,
+      SUM(CASE WHEN m.status='finished' AND a.role='chief' THEN 1 ELSE 0 END) done_chief,
+      SUM(CASE WHEN m.status='finished' AND a.role='assistant' THEN 1 ELSE 0 END) done_assistant,
+      SUM(CASE WHEN m.status='finished' AND a.role='recorder' THEN 1 ELSE 0 END) done_recorder,
+      SUM(CASE WHEN m.status='scheduled' AND a.role='chief' THEN 1 ELSE 0 END) up_chief,
+      SUM(CASE WHEN m.status='scheduled' AND a.role='assistant' THEN 1 ELSE 0 END) up_assistant,
+      SUM(CASE WHEN m.status='scheduled' AND a.role='recorder' THEN 1 ELSE 0 END) up_recorder
     FROM referees r LEFT JOIN assignments a ON a.referee_id=r.id AND a.status='assigned'
     LEFT JOIN matches m ON m.id=a.match_id
     GROUP BY r.id ORDER BY done DESC, upcoming DESC, r.id`))
@@ -925,8 +1049,12 @@ app.get('/api/overview', (_, res) => {
   const mats = all('SELECT * FROM matches')
   const done = mats.filter(m => m.status === 'finished')
   const pend = mats.filter(m => m.status === 'scheduled' && m.team_a && m.team_b)
-  // 排班联动速览：待赛覆盖率与冲突数
+    .filter(m => get('SELECT format FROM sports WHERE id=?', m.sport_id)?.format !== 'track')
+  // 排班联动速览：整场执法组覆盖率（主裁1/助理2/记录台 = 4 岗）与冲突数
   const unassigned = pend.filter(m => !get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, m.id)).length
+  const slotFilled = pend.reduce((n, m) => n + get(`SELECT COUNT(*) c FROM assignments WHERE match_id=? AND status='assigned'`, m.id).c, 0)
+  const slotTotal = pend.length * CREW_SLOT_TOTAL
+  const crewReady = pend.filter(m => missingRolesOfMatch(m.id).length === 0).length
   res.json({
     sports: sp.length,
     finishedMatches: done.length,
@@ -934,6 +1062,13 @@ app.get('/api/overview', (_, res) => {
     teams: all('SELECT id FROM teams').length || 0,
     athletes: all('SELECT id FROM athletes').length,
     unassignedMatches: unassigned,
+    crew: {
+      matches: pend.length,
+      crew_ready: crewReady,
+      slots_filled: slotFilled,
+      slots_total: slotTotal,
+      pct: slotTotal ? Math.round(slotFilled / slotTotal * 100) : 100
+    },
     refereeConflicts: all(`SELECT COUNT(DISTINCT a1.id) c FROM assignments a1
       JOIN assignments a2 ON a1.referee_id=a2.referee_id AND a1.id<a2.id AND a1.status='assigned' AND a2.status='assigned'
       JOIN matches m1 ON m1.id=a1.match_id JOIN matches m2 ON m2.id=a2.match_id
@@ -949,13 +1084,18 @@ app.post('/api/matches/:id/score', (req, res) => {
   if (m.team_a == null || m.team_b == null) return res.status(400).json({ error: '对阵尚未编排，先编排淘汰赛' })
   const sa = Number(score_a), sb = Number(score_b)
   if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0) return res.status(400).json({ error: '比分必须为非负整数' })
-  const chief = get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, m.id)
+  // 整场执法组预检：缺岗时不阻断录入，逐岗位返回补录预警
+  const missing = missingRolesOfMatch(m.id)
   try {
     finishMatch(m.id, sa, sb, tb_a, tb_b)
   } catch (e) {
     return res.status(400).json({ error: e.message })
   }
-  res.json({ ok: true, warning: chief ? null : '该场次未安排主裁，请注意补录执法记录' })
+  let warning = null
+  if (m.status === 'scheduled' && missing.length) {
+    warning = `该场次执法组未满编（缺 ${[...new Set(missing.map(r => ROLE_NAME[r]))].join('、')}），请注意补录执法记录`
+  }
+  res.json({ ok: true, warning })
 })
 app.post('/api/ko/:sportId', (req, res) => {
   const msg = generateKO(Number(req.params.sportId))

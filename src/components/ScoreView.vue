@@ -18,6 +18,7 @@ const trackSports = computed(() => store.sports.filter(s => s.format === 'track'
 const KO_STAGES = ['半决赛', '决赛', '季军']
 const isKO = m => KO_STAGES.includes(m?.stage)
 const winnerName = m => (m.winner != null && m.winner === m.team_a ? m.teamA?.name : m.teamB?.name)
+const missingCrewText = mid => Object.entries(store.crewStatus(mid).missing).map(([role, n]) => `${store.roleName(role)}×${n}`).join('、')
 
 const sa = ref(0), sb = ref(0), ta = ref(null), tb = ref(null)
 function open(m) { active.value = m; sa.value = m.score_a ?? 0; sb.value = m.score_b ?? 0; ta.value = null; tb.value = null }
@@ -31,7 +32,7 @@ async function saveScore() {
   }
   try {
     const r = await store.score(active.value.id, sa.value, sb.value, needTB.value ? ta.value : null, needTB.value ? tb.value : null)
-    toast.value = r?.warning ? '⚠️ ' + r.warning : '✅ 比分已录入，积分榜与执法记录已更新'
+    toast.value = r?.warning ? '⚠️ ' + r.warning : '✅ 比分已录入，积分榜与整场执法记录已更新'
     active.value = null
   } catch (e) {
     toast.value = '⚠️ ' + e.message
@@ -84,8 +85,13 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
         </div>
         <div v-if="m.note" class="note-line">📝 {{ m.note }}</div>
         <div class="crew-line">
-          <span v-if="store.chiefOf(m.id)" class="tag b">🧑‍⚖️ 主裁：{{ store.chiefOf(m.id).referee?.name }}</span>
-          <span v-else-if="m.status==='scheduled'" class="tag o">🟠 尚未安排主裁</span>
+          <template v-if="store.crewOf(m.id).length">
+            <span v-for="a in store.crewOf(m.id)" :key="a.id" class="tag" :class="a.role === 'chief' ? 'b' : 'gray'" style="margin-right:5px">
+              {{ a.role === 'chief' ? '🧑‍⚖️' : '🏷️' }} {{ store.roleName(a.role) }}：{{ a.referee?.name }}
+            </span>
+            <span v-if="!store.crewStatus(m.id).ready" class="tag o">🟠 执法组缺 {{ missingCrewText(m.id) }}</span>
+          </template>
+          <span v-else-if="m.status==='scheduled'" class="tag o">🟠 尚未安排执法组</span>
         </div>
         <div v-if="active?.id === m.id && needTB" class="tbrow">
           <span>⚔️ 常规时间平分 · 加时/点球决胜：</span>

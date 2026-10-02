@@ -24,7 +24,24 @@ export const useEventStore = defineStore('event', {
     unitOfUid: s => id => s.units.find(u => u.id === id),
     // 场次 -> 在派执法安排
     crewOf: s => mid => s.assignments.filter(a => a.match_id === mid),
-    chiefOf: s => mid => s.assignments.find(a => a.match_id === mid && a.role === 'chief')
+    chiefOf: s => mid => s.assignments.find(a => a.match_id === mid && a.role === 'chief'),
+    // 整场执法组编制（默认 主裁1·助理2·记录台1）
+    crewSpec: s => s.conflicts?.crew_spec || { chief: 1, assistant: 2, recorder: 1 },
+    // 场次执法组满编状态：{ filled, total, missing: {role: n} }
+    crewStatus: s => mid => {
+      const spec = s.conflicts?.crew_spec || { chief: 1, assistant: 2, recorder: 1 }
+      const crew = s.assignments.filter(a => a.match_id === mid)
+      const missing = {}
+      let filled = 0
+      Object.keys(spec).forEach(role => {
+        const has = crew.filter(a => a.role === role).length
+        filled += Math.min(has, spec[role])
+        if (has < spec[role]) missing[role] = spec[role] - has
+      })
+      const total = Object.values(spec).reduce((a, b) => a + b, 0)
+      return { filled, total, missing, ready: filled === total }
+    },
+    roleName: () => role => ({ chief: '主裁', assistant: '助理裁判', recorder: '记录台' })[role] || role
   },
   actions: {
     async init() {

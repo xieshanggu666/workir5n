@@ -29,6 +29,16 @@ const ballMatches = computed(() => store.matches
 const sportsWithScheduled = computed(() => store.sports.filter(s => ballMatches.value.some(m => m.sport_id === s.id && s.format !== 'track')))
 const iconOf = s => ({ '球类': '🏀', '田径': '🏃', '水上': '🏊', '棋牌': '♟️' }[s.category] || '🏅')
 
+// 整场执法组覆盖统计（主裁1·助理2·记录台1）
+const cov = computed(() => store.conflicts?.coverage || { matches: 0, crew_ready: 0, slots_total: 0, slots_filled: 0, pct: 100 })
+const incompleteMap = computed(() => new Map((store.conflicts?.incomplete_matches || []).map(x => [x.match_id, x])))
+const missingText = mid => {
+  const x = incompleteMap.value.get(mid)
+  if (!x) return ''
+  return Object.entries(x.missing_roles).map(([role, n]) => `${ROLE_NAME[role]}×${n}`).join('、')
+}
+const crewState = mid => store.crewStatus(mid)
+
 const forms = reactive({})   // match_id -> { referee_id, role }
 function formOf(mid) { if (!forms[mid]) forms[mid] = { referee_id: '', role: 'chief' }; return forms[mid] }
 const avRefs = mid => store.referees.filter(r => !store.crewOf(mid).some(a => a.referee_id === r.id))
@@ -62,7 +72,8 @@ async function submitAssign(mid, force = false) {
 
 async function doAuto() {
   const r = await store.autoAssign()
-  flash(`智能排班完成：成功 ${r.assigned.length} 场，跳过 ${r.skipped.length} 场`)
+  const slots = r.assigned.reduce((n, x) => n + (x.slots?.length || 0), 0)
+  flash(`整场智能排班完成：补齐 ${slots} 个执法岗位、覆盖 ${r.assigned.length} 场，${r.skipped.length} 场未满编`)
 }
 
 async function doRelease(a) {
@@ -81,7 +92,7 @@ function openReassign(a) {
 }
 const swapTargets = computed(() => {
   if (!reDlg.from) return []
-  return store.assignments.filter(a => a.id !== reDlg.from.id && a.role === 'chief' && a.match?.status === 'scheduled')
+  return store.assignments.filter(a => a.id !== reDlg.from.id && a.role === reDlg.from.role && a.match?.status === 'scheduled')
 })
 const replaceRefs = computed(() => {
   if (!reDlg.from) return []
@@ -145,7 +156,7 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
 <template>
   <div v-if="store.loaded">
     <div class="page-h">
-      <div><h2>📍 裁判排班与场地协同</h2><div class="sub">裁判分配 · 时间冲突检测 · 临时调班留痕 · 赛程变更联动执法安排</div></div>
+      <div><h2>📍 裁判排班与场地协同</h2><div class="sub">整场执法组协同（主裁·助理裁判·记录台）· 专长/等级匹配 · 时间冲突检测 · 工作量均衡 · 赛程变更联动</div></div>
       <div class="filters">
         <button class="chip" :class="{ on: tab === 'board' }" @click="tab = 'board'">🧑‍⚖️ 排班总览</button>
         <button class="chip" :class="{ on: tab === 'venue' }" @click="tab = 'venue'">🏟️ 场地协同<span v-if="clashList.length" class="dot-badge">{{ clashList.length }}</span></button>
@@ -157,8 +168,9 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
     <div v-if="toast" class="toast">{{ toast }}</div>
 
     <!-- 顶部预警条 -->
-    <div v-if="store.conflicts && (store.conflicts.unassigned.length || conflictCount || store.conflicts.skill_mismatch.length)" class="warnbar">
-      <span v-if="store.conflicts.unassigned.length" class="warn-item o">🟠 {{ store.conflicts.unassigned.length }} 场待赛未安排主裁</span>
+    <div v-if="store.conflicts && (store.conflicts.incomplete_matches.length || conflictCount || store.conflicts.skill_mismatch.length)" class="warnbar">
+      <span v-if="store.conflicts.incomplete_matches.length" class="warn-item o">🟠 {{ store.conflicts.incomplete_matches.length }} 场待赛执法组未满编</span>
+      <span v-if="store.conflicts.unassigned.length" class="warn-item o">🧑‍⚖️ {{ store.conflicts.unassigned.length }} 场未派主裁</span>
       <span v-if="store.conflicts.referee_conflicts.length" class="warn-item r">⛔ {{ store.conflicts.referee_conflicts.length }} 起裁判时间冲突</span>
       <span v-if="store.conflicts.venue_conflicts.length" class="warn-item r">🏟️ {{ store.conflicts.venue_conflicts.length }} 起场地同时段撞场</span>
       <span v-if="store.conflicts.skill_mismatch.length" class="warn-item y">⚠️ {{ store.conflicts.skill_mismatch.length }} 条跨专长执法</span>
@@ -167,18 +179,18 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
     <!-- ============ Tab 1：排班总览 ============ -->
     <template v-if="tab === 'board'">
       <div class="grid g4">
-        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ff7a2f,#ffb27e)"></span><span class="ic">🗓️</span><b>{{ ballMatches.length }}</b><em>待赛场次</em></div>
-        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">✅</span><b>{{ ballMatches.length - store.conflicts.unassigned.length }}</b><em>已安排主裁</em></div>
-        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ffb92b,#ffd98a)"></span><span class="ic">🟠</span><b>{{ store.conflicts.unassigned.length }}</b><em>待安排</em></div>
+        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ff7a2f,#ffb27e)"></span><span class="ic">🗓️</span><b>{{ cov.matches }}</b><em>待赛场次</em></div>
+        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">✅</span><b>{{ cov.crew_ready }}</b><em>执法组满编</em></div>
+        <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ffb92b,#ffd98a)"></span><span class="ic">🧑‍🤝‍🧑</span><b>{{ cov.slots_filled }}/{{ cov.slots_total }}</b><em>执法岗位覆盖（{{ cov.pct }}%）</em></div>
         <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#dd5b5b,#f0a1a1)"></span><span class="ic">⛔</span><b>{{ conflictCount }}</b><em>冲突预警</em></div>
       </div>
 
       <div class="card mt">
         <div class="caption">
-          <span>🧑‍⚖️ 待赛场次执法排班</span>
+          <span>🧑‍🤝‍🧑 待赛场次整场执法排班（主裁 1 · 助理裁判 2 · 记录台 1）</span>
           <div class="row">
-            <span class="hint">同裁判同时段自动拦截 · 专长不符提示</span>
-            <button class="btn primary sm" @click="doAuto">🤖 一键智能排班</button>
+            <span class="hint">专长匹配 · 等级契合 · 同时段拦截 · 负荷均衡</span>
+            <button class="btn primary sm" @click="doAuto">🤖 一键整场智能排班</button>
           </div>
         </div>
         <div class="pad" style="display:flex;flex-direction:column;gap:14px">
@@ -189,11 +201,12 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
                 <span class="tag" :class="m.stage === '决赛' || m.stage === '季军' ? 'y' : 'b'">{{ m.stage }}{{ m.group_name ? ' · ' + m.group_name : '' }}</span>
                 <b>{{ m.teamA?.name || '待定' }}</b><span class="vs">VS</span><b>{{ m.teamB?.name || '待定' }}</b>
                 <span class="ph" style="margin-left:auto">⏱ {{ m.time_label || '时间待定' }} · 📍 {{ m.venue?.name || '未指定' }}</span>
+                <span class="tag" :class="crewState(m.id).ready ? 'g' : 'o'">{{ crewState(m.id).ready ? '满编' : crewState(m.id).filled + '/' + crewState(m.id).total + ' 岗' }}</span>
               </div>
               <div class="ac-crew">
                 <template v-if="store.crewOf(m.id).length">
-                  <span v-for="a in store.crewOf(m.id)" :key="a.id" class="crew-chip">
-                    <span class="tag gray">{{ ROLE_NAME[a.role] }}</span>
+                  <span v-for="a in store.crewOf(m.id)" :key="a.id" class="crew-chip" :class="{ chief: a.role === 'chief' }">
+                    <span class="tag" :class="a.role === 'chief' ? 'b' : 'gray'">{{ ROLE_NAME[a.role] }}</span>
                     <b>{{ a.referee?.name }}</b>
                     <span v-if="a.referee?.sport && a.referee.sport !== s.name && a.referee.sport !== s.category" class="tag y" title="跨专长执法">跨项</span>
                     <button class="mini" title="临时调班" @click="openReassign(a)">🔄 调班</button>
@@ -201,6 +214,7 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
                   </span>
                 </template>
                 <span v-else class="tag o">🟠 尚无执法裁判</span>
+                <span v-if="missingText(m.id)" class="tag o" style="margin-left:auto">🟠 缺 {{ missingText(m.id) }}</span>
               </div>
               <div class="ac-form">
                 <select v-model="formOf(m.id).referee_id">
@@ -261,7 +275,9 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
               <span v-for="m in list" :key="m.id" class="slot-match">
                 <b>{{ store.sports.find(s => s.id === m.sport_id)?.name }}</b> · {{ m.stage }}{{ m.group_name || '' }}
                 {{ m.teamA?.name }} VS {{ m.teamB?.name }}
-                <span class="tag gray">{{ store.chiefOf(m.id)?.referee?.name || '主裁待安排' }}</span>
+                <span class="tag" :class="crewState(m.id).ready ? 'g' : 'o'">
+                  🧑‍🤝‍🧑 {{ crewState(m.id).ready ? '执法组满编' : '缺岗 ' + missingText(m.id) }}
+                </span>
                 <button class="mini" @click="tab = 'board'">去处理</button>
               </span>
             </div>
@@ -288,18 +304,18 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
     <!-- ============ Tab 3：裁判名册 ============ -->
     <template v-else-if="tab === 'refs'">
       <div class="card">
-        <div class="caption"><span>🧑‍⚖️ 裁判名册与执法负荷</span><span class="hint">已完赛/待赛场次自动汇总</span></div>
+        <div class="caption"><span>🧑‍⚖️ 裁判名册与执法负荷</span><span class="hint">按主裁/助理/记录台拆分；含历史完赛场次</span></div>
         <div class="pad">
           <table>
-            <thead><tr><th>姓名</th><th>专长项目</th><th>等级</th><th>状态</th><th>已执法</th><th>待执法</th><th>冲突</th></tr></thead>
+            <thead><tr><th>姓名</th><th>专长项目</th><th>等级</th><th>状态</th><th>已执法（主/助/记）</th><th>待执法（主/助/记）</th><th>冲突</th></tr></thead>
             <tbody>
               <tr v-for="r in store.referees" :key="r.id">
                 <td><b>{{ r.name }}</b></td>
                 <td>{{ r.sport || '综合执法' }}</td>
                 <td>{{ r.level }}</td>
                 <td><span class="tag" :class="refClashIds.has(r.id) ? 'r' : 'g'">{{ refClashIds.has(r.id) ? '时间冲突' : (r.status || '就绪') }}</span></td>
-                <td class="mono">{{ workloadOf(r.id).done || 0 }}</td>
-                <td class="mono">{{ workloadOf(r.id).upcoming || 0 }}</td>
+                <td class="mono">{{ workloadOf(r.id).done || 0 }} <span class="ph">({{ workloadOf(r.id).done_chief || 0 }}/{{ workloadOf(r.id).done_assistant || 0 }}/{{ workloadOf(r.id).done_recorder || 0 }})</span></td>
+                <td class="mono">{{ workloadOf(r.id).upcoming || 0 }} <span class="ph">({{ workloadOf(r.id).up_chief || 0 }}/{{ workloadOf(r.id).up_assistant || 0 }}/{{ workloadOf(r.id).up_recorder || 0 }})</span></td>
                 <td><span v-if="refClashIds.has(r.id)" class="tag r">需调班</span><span v-else class="tag gray">正常</span></td>
               </tr>
             </tbody>
@@ -368,14 +384,14 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
         <div class="pad-note">原安排：<b>{{ reDlg.from?.referee?.name }}</b> 担任 {{ ROLE_NAME[reDlg.from?.role] }}（{{ reDlg.from?.match ? reDlg.from.match.stage : '' }} · {{ reDlg.from?.match?.time_label }}）</div>
         <div class="row wrap mt8">
           <label class="row"><input type="radio" value="replace" v-model="reDlg.mode" /> 改派其他裁判</label>
-          <label class="row"><input type="radio" value="swap" v-model="reDlg.mode" /> 与另一场主裁对调</label>
+          <label class="row"><input type="radio" value="swap" v-model="reDlg.mode" /> 与另一场同岗位裁判对调</label>
         </div>
         <select v-if="reDlg.mode === 'replace'" v-model="reDlg.new_ref" class="mt8" style="width:100%">
           <option value="" disabled>选择接替裁判…</option>
-          <option v-for="r in replaceRefs" :key="r.id" :value="r.id">{{ r.name }}（{{ r.sport || '综合执法' }}）</option>
+          <option v-for="r in replaceRefs" :key="r.id" :value="r.id">{{ r.name }}（{{ r.sport || '综合执法' }} · {{ r.level }}）</option>
         </select>
         <select v-else v-model="reDlg.target_id" class="mt8" style="width:100%">
-          <option value="" disabled>选择对调场次的主裁安排…</option>
+          <option value="" disabled>选择对调场次的{{ ROLE_NAME[reDlg.from?.role] }}安排…</option>
           <option v-for="a in swapTargets" :key="a.id" :value="a.id">{{ a.referee?.name }} → {{ a.match?.time_label }} {{ a.match?.stage }}{{ a.match?.group_name || '' }}</option>
         </select>
         <textarea v-model="reDlg.reason" rows="2" class="mt8" placeholder="调班原因（必填，将写入留痕）" style="width:100%"></textarea>
@@ -435,6 +451,7 @@ const conflictCount = computed(() => (store.conflicts?.referee_conflicts.length 
 .ac-head .vs { color: var(--muted); font-size: 11px; font-weight: 700; }
 .ac-crew { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 .crew-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg2); border-radius: 10px; padding: 4px 8px; font-size: 12px; }
+.crew-chip.chief { background: #eaf4ff; }
 .ac-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .ac-form select { padding: 7px 9px; }
 .mini { background: #fff; border: 1px solid var(--line); border-radius: 7px; font-size: 11px; padding: 2px 7px; color: var(--muted); }
